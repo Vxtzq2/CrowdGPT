@@ -628,15 +628,7 @@ class SotaGPT(nn.Module):
 
     def forward_features(self, idx, use_chunked=True, use_ckpt=True):
         """Runs embeddings + all blocks + final LN. Returns [B, T, DIM]."""
-        # wte can be on CPU while idx arrives on DirectML. torch-directml
-        # can't mix CPU weight + DML index, so normalise devices first.
-        wte_dev = self.wte.weight.device
-        if idx.device != wte_dev:
-            idx = idx.to(wte_dev)
         x = self.wte(idx)
-        first_dev = self._block_device(0) if len(self.blocks) else self.cpu_device
-        if x.device != first_dev:
-            x = x.to(first_dev)
         cur_dev = x.device
 
         for i, block in enumerate(self.blocks):
@@ -1866,6 +1858,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .panel.flex{flex:1 1 auto;display:flex;flex-direction:column;min-height:160px}
 .panel-head{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px;font-family:var(--mono);font-size:11px;color:var(--text-muted);flex-wrap:wrap}
 .panel-head .pv{color:var(--text)}
+@font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");font-display:swap}
+:root{--sans:"Twemoji Country Flags",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; /* ...rest unchanged */}
 .progress-track{height:6px;background:var(--bg-softer);border:1px solid var(--border);border-radius:3px;overflow:hidden}
 .progress-fill{height:100%;width:0%;background:var(--accent);transition:width .4s ease}
 .dash-body{display:grid;grid-template-columns:1fr;gap:12px;flex:1 1 auto;min-height:0}
