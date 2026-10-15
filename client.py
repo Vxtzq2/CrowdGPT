@@ -2,7 +2,7 @@
 """
 CrowdGPT GUI Client v1, DirectML runtime fallback.
 """
-import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
+import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes
 from pathlib import Path
 import webview
 import numpy as np
@@ -237,11 +237,15 @@ def decode_one(tok_id):
     s = decode_ids([tok_id], max_chars=32)
     return s if s.strip() else "␠"
 
+# =========================================================================
+# Logos + window icon
+# =========================================================================
 LOGO_URI_LIGHT = ""
 LOGO_URI_DARK = ""
 _lp_light = Path(__file__).parent / "docs/logo-black.svg"
-_lp_app = Path(__file__).parent / "docs/logo-app.svg"
-_lp_dark = Path(__file__).parent / "docs/logo-white.svg"
+_lp_app   = Path(__file__).parent / "docs/logo-app.svg"
+_lp_dark  = Path(__file__).parent / "docs/logo-white.svg"
+
 if _lp_light.exists():
     try:
         LOGO_URI_LIGHT = "data:image/svg+xml;base64," + base64.b64encode(_lp_light.read_bytes()).decode()
@@ -255,29 +259,325 @@ if _lp_dark.exists():
 if not LOGO_URI_DARK:
     LOGO_URI_DARK = LOGO_URI_LIGHT
 
-ICON_PATH = None
+# --- icon plumbing -------------------------------------------------------
+ICON_PATH = None          # raster path handed to pywebview (PNG / ICO / etc.)
+WINDOWS_ICO_PATH = None   # real .ico used by the native Win32 icon swap
+WINDOW_TITLE = "CrowdGPT"
 _cleanup_icon = []
-if _lp_light.exists():
+
+def _render_svg_to_png(svg_path, size: int = 256):
+    """
+    Render an SVG to a PNG using whichever backend is available.
+    Returns path to a temp PNG, or None. Never raises.
+    Backends tried, in order:
+      1. cairosvg          (best on Linux/macOS; needs Cairo DLLs on Windows)
+      2. svglib+reportlab  (pure Python — recommended on Windows)
+      3. resvg-py          (Rust wheel, fast, works on Windows)
+      4. Qt (PySide6/PyQt5, ships with pywebview on Windows)
+      5. ImageMagick CLI
+      6. Inkscape CLI
+    """
+    svg_path = Path(svg_path)
+    if not svg_path.exists():
+        return None
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    tmp.close()
+    out = tmp.name
+
+    def _ok():
+        try:
+            return os.path.getsize(out) > 100
+        except Exception:
+            return False
+
+    # --- 1. cairosvg ----------------------------------------------------
     try:
         import cairosvg
-        png_bytes = cairosvg.svg2png(url=str(_lp_app), output_width=256, output_height=256)
-        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        tmp.write(png_bytes)
-        tmp.close()
-        ICON_PATH = os.path.abspath(tmp.name)
-        _cleanup_icon.append(ICON_PATH)
-        def _clean():
-            for p in _cleanup_icon:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
-        atexit.register(_clean)
-    except ImportError:
-        ICON_PATH = os.path.abspath(str(_lp_app))
-    except Exception:
-        ICON_PATH = os.path.abspath(str(_lp_app))
+        cairosvg.svg2png(url=str(svg_path), write_to=out,
+                         output_width=size, output_height=size)
+        if _ok():
+            log.info("[icon] Rendered SVG via cairosvg")
+            return out
+    except Exception as e:
+        log.debug(f"[icon] cairosvg failed: {e}")
 
+    # --- 2. svglib + reportlab (pure Python — best on Windows) ----------
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        drawing = svg2rlg(str(svg_path))
+        if drawing is not None:
+            sw, sh = float(drawing.width or 0), float(drawing.height or 0)
+            if sw > 0 and sh > 0:
+                scale = size / max(sw, sh)
+                drawing.scale(scale, scale)
+                drawing.width = sw * scale
+                drawing.height = sh * scale
+            renderPM.drawToFile(drawing, out, fmt='PNG')
+            if _ok():
+                log.info("[icon] Rendered SVG via svglib+reportlab")
+                return out
+    except Exception as e:
+        log.debug(f"[icon] svglib failed: {e}")
+
+    # --- 3. resvg-py ----------------------------------------------------
+    try:
+        import resvg_py
+        resvg_py.svg_to_bytes(svg_path=str(svg_path), write_to=out,
+                              width=size, height=size)
+        if _ok():
+            log.info("[icon] Rendered SVG via resvg-py")
+            return out
+    except Exception as e:
+        log.debug(f"[icon] resvg-py failed: {e}")
+
+    # --- 4. Qt (PySide6 / PyQt5) ---------------------------------------
+    for mod in ("PySide6", "PyQt5"):
+        try:
+            if mod == "PySide6":
+                from PySide6.QtSvg import QSvgRenderer
+                from PySide6.QtGui import QImage, QPainter
+                from PySide6.QtCore import QByteArray
+            else:
+                from PyQt5.QtSvg import QSvgRenderer
+                from PyQt5.QtGui import QImage, QPainter
+                from PyQt5.QtCore import QByteArray
+            renderer = QSvgRenderer(QByteArray(svg_path.read_bytes()))
+            if not renderer.isValid():
+                continue
+            img = QImage(size, size, QImage.Format_ARGB32)
+            img.fill(0)
+            painter = QPainter(img)
+            renderer.render(painter)
+            painter.end()
+            if img.save(out, "PNG") and _ok():
+                log.info(f"[icon] Rendered SVG via {mod}")
+                return out
+        except Exception as e:
+            log.debug(f"[icon] {mod} failed: {e}")
+
+    # --- 5. ImageMagick CLI --------------------------------------------
+    try:
+        r = subprocess.run(
+            ["magick", "-background", "none", str(svg_path),
+             "-resize", f"{size}x{size}", out],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode == 0 and _ok():
+            log.info("[icon] Rendered SVG via ImageMagick")
+            return out
+    except Exception as e:
+        log.debug(f"[icon] magick failed: {e}")
+
+    # --- 6. Inkscape CLI -----------------------------------------------
+    try:
+        r = subprocess.run(
+            ["inkscape", str(svg_path),
+             "-w", str(size), "-h", str(size), "-o", out],
+            capture_output=True, timeout=60,
+        )
+        if r.returncode == 0 and _ok():
+            log.info("[icon] Rendered SVG via Inkscape")
+            return out
+    except Exception as e:
+        log.debug(f"[icon] inkscape failed: {e}")
+
+    # Nothing worked → cleanup and return None
+    try:
+        os.unlink(out)
+    except Exception:
+        pass
+    return None
+
+
+def _png_to_ico(png_path: str, sizes=(256, 128, 64, 48, 32, 16)):
+    """Convert PNG to a multi-size ICO. Returns path or None. Never raises."""
+    try:
+        from PIL import Image
+    except ImportError:
+        log.warning("[icon] Pillow not installed — cannot build .ico for Windows. "
+                    "Install with: pip install pillow")
+        return None
+    try:
+        img = Image.open(png_path).convert("RGBA")
+        tmp = tempfile.NamedTemporaryFile(suffix='.ico', delete=False)
+        tmp.close()
+        img.save(tmp.name, format="ICO", sizes=[(s, s) for s in sizes])
+        return tmp.name
+    except Exception as e:
+        log.warning(f"[icon] PNG→ICO failed: {e}")
+        return None
+
+
+def _cleanup_icon_files():
+    for p in _cleanup_icon:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
+atexit.register(_cleanup_icon_files)
+
+
+def _find_best_icon():
+    """
+    Resolution order (first hit wins):
+      1. icon.ico next to the script  (explicit user override, best on Windows)
+      2. docs/icon.ico                (explicit user override)
+      3. docs/logo-app.svg            (rendered via whatever SVG engine is
+                                       available — this is the *correct* app
+                                       logo, so it beats any stray .png)
+      4. icon.png next to the script
+      5. docs/logo-app.png
+    Returns (raster_path_for_webview, ico_path_for_windows_or_None).
+    Never raises. Never tries to open a directory.
+    """
+    base = Path(__file__).parent
+
+    ico_candidates = [base / "icon.ico", base / "docs" / "icon.ico"]
+    svg_candidates = [base / "docs" / "logo-app.svg",
+                      base / "logo-app.svg"]
+    png_candidates = [base / "icon.png",
+                      base / "docs" / "logo-app.png"]
+
+    # 1/2. Direct .ico — perfect on Windows, accepted by pywebview elsewhere.
+    for ico in ico_candidates:
+        if ico.is_file():
+            log.info(f"[icon] Using existing .ico: {ico}")
+            return str(ico), str(ico)
+
+    # 3. Render the SVG. Preferred over PNG because logo-app.svg is the
+    #    canonical app icon and any random .png may be the wrong image.
+    for svg in svg_candidates:
+        if svg.is_file():
+            rendered = _render_svg_to_png(svg, 256)
+            if rendered:
+                png_path = Path(rendered)
+                _cleanup_icon.append(rendered)
+                raster = str(png_path)
+                ico_path = None
+                if sys.platform == "win32":
+                    ico_path = _png_to_ico(raster)
+                    if ico_path:
+                        _cleanup_icon.append(ico_path)
+                        log.info(f"[icon] Built multi-size ICO: {ico_path}")
+                    else:
+                        log.warning("[icon] SVG rendered but PNG→ICO failed. "
+                                    "Install Pillow: pip install pillow")
+                return raster, ico_path
+            # Non-Windows can load SVG directly.
+            if sys.platform != "win32":
+                log.info(f"[icon] No SVG renderer found — using SVG directly: {svg}")
+                return str(svg), None
+            log.warning(
+                "[icon] Could not render SVG. Install one of:\n"
+                "    pip install svglib reportlab    (recommended on Windows)\n"
+                "    pip install cairosvg            (Linux/macOS)\n"
+                "    pip install resvg-py\n"
+                "  Or drop a real icon.ico next to client.py."
+            )
+            break  # don't repeat the warning for every svg candidate
+
+    # 4/5. Existing PNG.
+    for png in png_candidates:
+        if png.is_file():
+            raster = str(png)
+            ico_path = None
+            if sys.platform == "win32":
+                ico_path = _png_to_ico(raster)
+                if ico_path:
+                    _cleanup_icon.append(ico_path)
+                    log.info(f"[icon] Built multi-size ICO: {ico_path}")
+                else:
+                    log.warning("[icon] Could not build .ico — window will "
+                                "use the default. Install Pillow: pip install pillow")
+            log.info(f"[icon] Using PNG: {png}")
+            return raster, ico_path
+
+    log.warning("[icon] No icon source found — window will use the default.")
+    return None, None
+
+
+ICON_PATH, WINDOWS_ICO_PATH = _find_best_icon()
+# =========================================================================
+# Windows native icon swap
+# =========================================================================
+def set_windows_icon(window_title: str, ico_path: str):
+    """
+    Set the titlebar + taskbar icon of the top-level window `window_title`.
+    Only runs on Windows and only accepts a real .ico file.
+    """
+    if sys.platform != "win32" or not ico_path:
+        return
+    ico_path = os.path.abspath(ico_path)
+    if not os.path.exists(ico_path):
+        log.warning(f"[icon] not found: {ico_path}")
+        return
+    if not ico_path.lower().endswith(".ico"):
+        log.warning(f"[icon] not an .ico file: {ico_path}")
+        return
+
+    # Explicit argtypes prevent 64-bit pointer truncation.
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes   = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.FindWindowW.restype    = ctypes.c_void_p
+    user32.LoadImageW.argtypes    = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    user32.LoadImageW.restype     = ctypes.c_void_p
+    user32.SendMessageW.argtypes  = [ctypes.c_void_p, ctypes.c_uint,
+                                     ctypes.c_void_p, ctypes.c_void_p]
+    user32.SendMessageW.restype   = ctypes.c_void_p
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype  = ctypes.c_int
+
+    hwnd = user32.FindWindowW(None, window_title)
+    if not hwnd:
+        log.warning(f"[icon] window '{window_title}' not found")
+        return
+
+    IMAGE_ICON      = 1
+    LR_LOADFROMFILE = 0x0010
+    WM_SETICON      = 0x0080
+    ICON_SMALL      = 0
+    ICON_BIG        = 1
+    SM_CXSMICON     = 49
+    SM_CYSMICON     = 50
+
+    cx = user32.GetSystemMetrics(SM_CXSMICON) or 16
+    cy = user32.GetSystemMetrics(SM_CYSMICON) or 16
+
+    hicon_small = user32.LoadImageW(None, ico_path, IMAGE_ICON, cx, cy, LR_LOADFROMFILE)
+    # (0, 0) with no LR_DEFAULTSIZE → LoadImage picks the largest icon in the file.
+    hicon_big   = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+
+    if hicon_small:
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+    if hicon_big:
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+
+    if not hicon_small and not hicon_big:
+        err = ctypes.get_last_error()
+        log.warning(f"[icon] LoadImageW failed (err={err}) for {ico_path}")
+    else:
+        log.info(f"[icon] Applied window icon: {ico_path}")
+
+def _wait_for_window(title: str, timeout: float = 5.0) -> bool:
+    """Poll for the top-level window to exist."""
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.FindWindowW.restype  = ctypes.c_void_p
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if user32.FindWindowW(None, title):
+            return True
+        time.sleep(0.1)
+    return False
+
+# =========================================================================
+# Backend detection
+# =========================================================================
 def get_available_backends():
     backends = {}
     backends['cuda'] = torch.cuda.is_available() and not (hasattr(torch.version, 'hip') and torch.version.hip)
@@ -1561,7 +1861,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                             emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
                             emit('log', "🔻 Falling back to CPU-only model...")
                             model.to_cpu_only()
-                            train_backend_local = "CPU (fallback)"
                             # Rebuild optimizer over same params — objects unchanged
                             bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
                             ep = list(model.engram.parameters())
@@ -1840,6 +2139,8 @@ main{flex:1 1 auto;min-height:0;overflow-y:auto;padding:clamp(10px,2vw,18px) cla
 .fg label{display:block;font-size:9px;color:var(--text-muted);margin-bottom:3px;font-family:var(--mono);text-transform:uppercase}
 input{width:100%;font-family:inherit;font-size:12.5px;background:var(--bg-softer);color:var(--text);border:1px solid var(--border);padding:8px 10px;border-radius:4px;outline:none}
 input:focus{border-color:var(--accent)}
+@font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");font-display:swap}
+:root{--sans:"Twemoji Country Flags",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; /* ...rest unchanged */}
 button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px}
 .btn-primary{background:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
 .btn-primary:hover:not(:disabled){opacity:.85}
@@ -2202,6 +2503,13 @@ class Api:
         self.emit('log', "👋 Training stopped by user.")
 
 def startup():
+    """Runs on a background thread once the webview is live."""
+    # Give the OS a beat to actually create the HWND, then poll for it.
+    if sys.platform == "win32" and WINDOWS_ICO_PATH:
+        _wait_for_window(WINDOW_TITLE, timeout=5.0)
+        time.sleep(0.15)
+        set_windows_icon(WINDOW_TITLE, WINDOWS_ICO_PATH)
+
     try:
         scr = webview.screens[0]
         aw, ah = scr.width, scr.height
@@ -2216,8 +2524,37 @@ def startup():
     except Exception:
         pass
 
+def _create_window_safe(title, html, icon_path, kwargs):
+    """
+    pywebview's Windows backend raises a *native* exception (not TypeError)
+    when `icon=` points at a non-raster file (e.g. an SVG). Guard against that.
+    """
+    usable = False
+    if icon_path and os.path.exists(icon_path):
+        low = icon_path.lower()
+        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
+            usable = True
+    if usable:
+        try:
+            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
+        except Exception as e:
+            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
+    try:
+        return webview.create_window(title, html=html, **kwargs)
+    except TypeError:
+        kwargs.pop("min_size", None)
+        return webview.create_window(title, html=html, **kwargs)
+
 if __name__ == "__main__":
     print(f"CrowdGPT client v{CLIENT_VERSION}")
+
+    # Give the taskbar a stable identity so it uses our icon, not Python's.
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
+        except Exception:
+            pass
+
     try:
         if check_for_update():
             print("Update applied. Restarting...")
@@ -2229,15 +2566,10 @@ if __name__ == "__main__":
     start_tokenizer_loader()
 
     kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
-    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT).replace("__LOGO_DARK__", LOGO_URI_DARK).replace("__VERSION__", CLIENT_VERSION))
+    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT)
+                    .replace("__LOGO_DARK__", LOGO_URI_DARK)
+                    .replace("__VERSION__", CLIENT_VERSION))
 
-    try:
-        if ICON_PATH and os.path.exists(ICON_PATH):
-            window = webview.create_window("CrowdGPT", html=html_out, icon=ICON_PATH, **kwargs)
-        else:
-            window = webview.create_window("CrowdGPT", html=html_out, **kwargs)
-    except TypeError:
-        window = webview.create_window("CrowdGPT", html=html_out, **kwargs)
-
+    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
     api.window = window
     webview.start(startup, debug=False)
